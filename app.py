@@ -200,11 +200,30 @@ st.subheader("Donor overlap (name-based)")
 st.caption("Donors who gave to the selected candidate *and* at least one other candidate (matched by canonicalized donor name).")
 
 if selected_candidate:
-    rpc = sb.rpc(
-        "get_name_overlap_for_candidate",
-        {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
-    ).execute()
-    overlap_df = to_df(getattr(rpc, "data", None))
+    # PATCH: p_donor_bucket=None ("All") yields zero rows for text-typed RPC filters.
+    # For "All", call twice and concatenate.
+    if p_donor_bucket is None:
+        rpc_entity = sb.rpc(
+            "get_name_overlap_for_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": "Entity"},
+        ).execute()
+        rpc_individual = sb.rpc(
+            "get_name_overlap_for_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": "Individual"},
+        ).execute()
+        overlap_df = pd.concat(
+            [
+                to_df(getattr(rpc_entity, "data", None)),
+                to_df(getattr(rpc_individual, "data", None)),
+            ],
+            ignore_index=True,
+        )
+    else:
+        rpc = sb.rpc(
+            "get_name_overlap_for_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
+        ).execute()
+        overlap_df = to_df(getattr(rpc, "data", None))
 
     if not overlap_df.empty:
         overlap_df["other_candidate_display"] = overlap_df["other_candidate"].fillna("").map(title_case_name)
@@ -288,12 +307,24 @@ if selected_candidate:
     # Default: flat table (best for dataframe)
     use_flat = st.checkbox("Use flat table (recommended)", value=True)
 
-    # PATCH: Use the existing RPC and flatten JSON client-side (since get_prior_donor_history_flat is not present)
-    rpc3 = sb.rpc(
-        "get_donors_prior_history_before_candidate",
-        {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
-    ).execute()
-    prior_json_rows = getattr(rpc3, "data", None) or []
+    # PATCH: Use the existing RPC and flatten JSON client-side (since get_prior_donor_history_flat is not present).
+    # Also, p_donor_bucket=None ("All") yields zero rows for text-typed RPC filters; call twice and combine.
+    if p_donor_bucket is None:
+        rpc3_entity = sb.rpc(
+            "get_donors_prior_history_before_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": "Entity"},
+        ).execute()
+        rpc3_individual = sb.rpc(
+            "get_donors_prior_history_before_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": "Individual"},
+        ).execute()
+        prior_json_rows = (getattr(rpc3_entity, "data", None) or []) + (getattr(rpc3_individual, "data", None) or [])
+    else:
+        rpc3 = sb.rpc(
+            "get_donors_prior_history_before_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
+        ).execute()
+        prior_json_rows = getattr(rpc3, "data", None) or []
 
     if not prior_json_rows:
         st.info("No prior-history rows returned (either none exist, or RPC returned zero rows).")
