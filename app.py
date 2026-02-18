@@ -288,67 +288,84 @@ if selected_candidate:
     # Default: flat table (best for dataframe)
     use_flat = st.checkbox("Use flat table (recommended)", value=True)
 
-    if use_flat:
-        rpc3 = sb.rpc(
-            "get_prior_donor_history_flat",
-            {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
-        ).execute()
-        prior_df = to_df(getattr(rpc3, "data", None))
+    # PATCH: Use the existing RPC and flatten JSON client-side (since get_prior_donor_history_flat is not present)
+    rpc3 = sb.rpc(
+        "get_donors_prior_history_before_candidate",
+        {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
+    ).execute()
+    prior_json_rows = getattr(rpc3, "data", None) or []
 
-        if not prior_df.empty:
-            prior_df["other_candidate_display"] = prior_df["other_candidate"].fillna("").map(title_case_name)
-            prior_df = prior_df.sort_values(
-                ["amount_to_candidate_all_time", "total_to_other_candidate"],
-                ascending=[False, False],
-            )
-
-            st.dataframe(
-                prior_df[[
-                    "donor_bucket",
-                    "donor_name_canonical",
-                    "donor_name_example",
-                    "amount_to_candidate_all_time",
-                    "first_to_candidate",
-                    "last_to_candidate",
-                    "other_candidate_display",
-                    "total_to_other_candidate",
-                    "n_to_other_candidate",
-                    "first_to_other_candidate",
-                    "last_to_other_candidate",
-                ]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            download_button(
-                prior_df[[
-                    "donor_bucket",
-                    "donor_name_canonical",
-                    "donor_name_example",
-                    "amount_to_candidate_all_time",
-                    "first_to_candidate",
-                    "last_to_candidate",
-                    "other_candidate",
-                    "total_to_other_candidate",
-                    "n_to_other_candidate",
-                    "first_to_other_candidate",
-                    "last_to_other_candidate",
-                ]],
-                filename=f"prior_history_flat_{selected_candidate}_{datetime.now().date()}.csv",
-                label="Download prior history (flat) CSV",
-            )
-        else:
-            st.info("No prior-history rows returned (either none exist, or RPC returned zero rows).")
-
+    if not prior_json_rows:
+        st.info("No prior-history rows returned (either none exist, or RPC returned zero rows).")
     else:
-        # Raw JSON version
-        rpc3 = sb.rpc(
-            "get_donors_prior_history_before_candidate",
-            {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
-        ).execute()
-        prior_json_df = to_df(getattr(rpc3, "data", None))
+        if use_flat:
+            flat_rows = []
+            for r in prior_json_rows:
+                hist = r.get("other_candidate_history_prior") or []
+                for h in hist:
+                    flat_rows.append({
+                        "donor_bucket": r.get("donor_bucket"),
+                        "donor_name_canonical": r.get("donor_name_canonical"),
+                        "donor_name_example": r.get("donor_name_example"),
+                        "amount_to_candidate_all_time": r.get("amount_to_candidate_all_time"),
+                        "first_to_candidate": r.get("first_to_candidate"),
+                        "last_to_candidate": r.get("last_to_candidate"),
+                        "other_candidate": h.get("candidate"),
+                        "total_to_other_candidate": h.get("total"),
+                        "n_to_other_candidate": h.get("n"),
+                        "first_to_other_candidate": h.get("first_date"),
+                        "last_to_other_candidate": h.get("last_date"),
+                    })
 
-        if not prior_json_df.empty:
+            prior_df = to_df(flat_rows)
+
+            if not prior_df.empty:
+                prior_df["other_candidate_display"] = prior_df["other_candidate"].fillna("").map(title_case_name)
+                prior_df = prior_df.sort_values(
+                    ["amount_to_candidate_all_time", "total_to_other_candidate"],
+                    ascending=[False, False],
+                )
+
+                st.dataframe(
+                    prior_df[[
+                        "donor_bucket",
+                        "donor_name_canonical",
+                        "donor_name_example",
+                        "amount_to_candidate_all_time",
+                        "first_to_candidate",
+                        "last_to_candidate",
+                        "other_candidate_display",
+                        "total_to_other_candidate",
+                        "n_to_other_candidate",
+                        "first_to_other_candidate",
+                        "last_to_other_candidate",
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                download_button(
+                    prior_df[[
+                        "donor_bucket",
+                        "donor_name_canonical",
+                        "donor_name_example",
+                        "amount_to_candidate_all_time",
+                        "first_to_candidate",
+                        "last_to_candidate",
+                        "other_candidate",
+                        "total_to_other_candidate",
+                        "n_to_other_candidate",
+                        "first_to_other_candidate",
+                        "last_to_other_candidate",
+                    ]],
+                    filename=f"prior_history_flat_{selected_candidate}_{datetime.now().date()}.csv",
+                    label="Download prior history (flat) CSV",
+                )
+            else:
+                st.info("No prior-history details found inside other_candidate_history_prior for these donors.")
+        else:
+            prior_json_df = to_df(prior_json_rows)
+
             st.dataframe(
                 prior_json_df[[
                     "donor_bucket",
@@ -367,5 +384,3 @@ if selected_candidate:
                 filename=f"prior_history_json_{selected_candidate}_{datetime.now().date()}.csv",
                 label="Download prior history (JSON) CSV",
             )
-        else:
-            st.info("No prior-history rows returned (either none exist, or RPC returned zero rows).")
