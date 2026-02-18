@@ -76,14 +76,29 @@ selected_candidate = st.sidebar.selectbox(
 
 show_charts = st.sidebar.checkbox("Show charts", value=True)
 
-# Filter by office/district only (election_year intentionally removed from UI)
-meta_resp = sb.table("v_candidate_totals").select("office,district").execute()
+# Optional: filter by year/office/district (metadata)
+meta_resp = sb.table("v_candidate_totals").select("election_year,office,district").execute()
 meta_rows = meta_resp.data or []
+years = sorted({r.get("election_year") for r in meta_rows if r.get("election_year") is not None})
 offices = sorted({r.get("office") for r in meta_rows if r.get("office")})
 districts = sorted({r.get("district") for r in meta_rows if r.get("district")})
 
+year_filter = st.sidebar.multiselect(
+    "Election year",
+    options=years,
+    default=years[-1:] if years else []
+)
 office_filter = st.sidebar.multiselect("Office", options=offices, default=offices if offices else [])
 district_filter = st.sidebar.multiselect("District", options=districts, default=districts if districts else [])
+
+# Donor bucket filter used for name-based RPCs
+donor_bucket_filter = st.sidebar.selectbox(
+    "Donor bucket (overlap/history)",
+    options=["All", "Entity", "Individual"],
+    index=0,
+)
+
+p_donor_bucket = None if donor_bucket_filter == "All" else donor_bucket_filter
 
 st.sidebar.divider()
 st.sidebar.header("Stay in touch")
@@ -98,15 +113,18 @@ with st.sidebar.form("contact_form", clear_on_submit=True):
         if not email or "@" not in email:
             st.error("Please enter a valid email address.")
         else:
-            ins = sb.table("contact_signups").insert({
-                "email": email.strip(),
-                "name": name.strip() or None,
-                "zip5": (zip5.strip() or None),
-                "source": source.strip() or None,
-            }).execute()
-            if getattr(ins, "data", None) is not None:
-                st.success("Thanks! You're signed up.")
-            else:
+            try:
+                ins = sb.table("contact_signups").insert({
+                    "email": email.strip(),
+                    "name": name.strip() or None,
+                    "zip5": (zip5.strip() or None),
+                    "source": source.strip() or None,
+                }).execute()
+                if getattr(ins, "data", None) is not None:
+                    st.success("Thanks! You're signed up.")
+                else:
+                    st.error("Signup failed. Please try again later.")
+            except Exception:
                 st.error("Signup failed. Please try again later.")
 
 
@@ -115,17 +133,17 @@ with st.sidebar.form("contact_form", clear_on_submit=True):
 # -----------------------------
 st.subheader("Candidate totals (by donor bucket)")
 
-# election_year intentionally removed from select + display
 totals_resp = sb.table("v_candidate_totals").select(
-    "office,district,candidate,committee_name,committee_type,public_funding_requested,donor_bucket,txns,total_amount"
+    "election_year,office,district,candidate,committee_name,committee_type,public_funding_requested,donor_bucket,txns,total_amount"
 ).execute()
 totals_df = to_df(totals_resp.data)
 
 if not totals_df.empty:
-    # filters
-    if office_filter and "office" in totals_df.columns:
+    if year_filter:
+        totals_df = totals_df[totals_df["election_year"].isin(year_filter)]
+    if office_filter:
         totals_df = totals_df[totals_df["office"].isin(office_filter)]
-    if district_filter and "district" in totals_df.columns:
+    if district_filter:
         totals_df = totals_df[totals_df["district"].isin(district_filter)]
 
     totals_df["candidate_display"] = totals_df["candidate"].fillna("").map(title_case_name)
@@ -136,21 +154,24 @@ if not totals_df.empty:
 
     totals_df = totals_df.sort_values(["total_amount"], ascending=False)
 
+    # REMOVE election_year from display (per your request)
+    display_cols = [
+        "office","district","candidate_display",
+        "donor_bucket","txns","total_amount",
+        "committee_name","committee_type","public_funding_requested"
+    ]
     st.dataframe(
-        totals_df[[
-            "office", "district", "candidate_display",
-            "donor_bucket", "txns", "total_amount",
-            "committee_name", "committee_type", "public_funding_requested"
-        ]],
+        totals_df[display_cols],
         use_container_width=True,
         hide_index=True,
     )
 
+    download_cols = [
+        "office","district","candidate","donor_bucket","txns","total_amount",
+        "committee_name","committee_type","public_funding_requested"
+    ]
     download_button(
-        totals_df[[
-            "office", "district", "candidate", "donor_bucket", "txns", "total_amount",
-            "committee_name", "committee_type", "public_funding_requested"
-        ]],
+        totals_df[download_cols],
         filename=f"candidate_totals_{datetime.now().date()}.csv",
         label="Download candidate totals CSV",
     )
@@ -173,36 +194,27 @@ else:
 
 
 # -----------------------------
-# Section 2: Donor overlap (name-based) via RPC
+# Section 2: Name-based donor overlap (RPC)
 # -----------------------------
 st.subheader("Donor overlap (name-based)")
-st.caption(
-    "Donors who gave to the selected candidate *and* at least one other candidate "
-    "(canonical-name matching; donor_key not used)."
-)
+st.caption("Donors who gave to the selected candidate *and* at least one other candidate (matched by canonicalized donor name).")
 
 if selected_candidate:
-    donor_bucket_choice = st.selectbox("Donor bucket", options=["All", "Entity", "Individual"], index=0)
-    p_donor_bucket = None if donor_bucket_choice == "All" else donor_bucket_choice
-
-    rpc = sb.rpc("get_name_overlap_for_candidate", {
-        "p_candidate": selected_candidate,
-        "p_donor_bucket": p_donor_bucket
-    }).execute()
-
+    rpc = sb.rpc(
+        "get_name_overlap_for_candidate",
+        {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
+    ).execute()
     overlap_df = to_df(getattr(rpc, "data", None))
 
     if not overlap_df.empty:
-        # Optional: show only "other candidate" rows (this function already returns only other candidates,
-        # but keep the checkbox for continuity in case you later change the function.)
-        only_others = st.checkbox("Exclude selected candidate rows (show 'other candidates' only)", value=True)
-        if only_others and "other_candidate" in overlap_df.columns:
-            # rows are inherently "other_candidate" rows; no-op kept for UI stability
-            pass
-
         overlap_df["other_candidate_display"] = overlap_df["other_candidate"].fillna("").map(title_case_name)
 
-        # Sort: biggest target totals first, then biggest other totals
+        # Controls
+        only_others = st.checkbox("Show only the 'other candidates' rows", value=True)
+        if only_others:
+            # this RPC already returns other_candidate rows, but keep checkbox in case function changes later
+            pass
+
         overlap_df = overlap_df.sort_values(
             ["total_to_target", "total_to_other_candidate", "other_candidate"],
             ascending=[False, False, True],
@@ -241,27 +253,119 @@ if selected_candidate:
                 "last_to_other",
             ]],
             filename=f"name_overlap_{selected_candidate}_{datetime.now().date()}.csv",
-            label="Download name-overlap CSV",
+            label="Download name overlap CSV",
         )
 
         if show_charts:
-            # Top 25 canonical donors by total_to_target (within overlap set)
-            top_donors = (
-                overlap_df.groupby(["donor_name_canonical"], as_index=False)["total_to_target"].max()
-                .sort_values("total_to_target", ascending=False)
-                .head(25)
-            )
+            # Top 25 overlap donors by total_to_target
+            top = overlap_df.sort_values("total_to_target", ascending=False).head(25)
             c2 = (
-                alt.Chart(top_donors)
+                alt.Chart(top)
                 .mark_bar()
                 .encode(
-                    x=alt.X("total_to_target:Q", title=f"Total to {title_case_name(selected_candidate)}"),
-                    y=alt.Y("donor_name_canonical:N", sort="-x", title="Top donors (canonical name)"),
+                    x=alt.X("total_to_target:Q", title=f"Total to {selected_candidate}"),
+                    y=alt.Y("donor_name_canonical:N", sort="-x", title="Top overlap donors"),
                     tooltip=["donor_name_canonical:N", "total_to_target:Q"],
                 )
             )
             st.altair_chart(c2, use_container_width=True)
     else:
-        st.info("No name-overlap found for this candidate (or the RPC returned no rows).")
+        st.info("No overlap found for this candidate (or RPC returned zero rows).")
 else:
     st.warning("No candidates found. Populate v_candidates first.")
+
+
+# -----------------------------
+# Section 3: Donors to candidate + PRIOR history (before first donation to candidate)
+# -----------------------------
+st.subheader("Donors to candidate + prior history (before first donation)")
+
+st.caption(
+    "For each donor to the selected candidate, show which other candidates they supported *before* their first donation to the selected candidate."
+)
+
+if selected_candidate:
+    # Default: flat table (best for dataframe)
+    use_flat = st.checkbox("Use flat table (recommended)", value=True)
+
+    if use_flat:
+        rpc3 = sb.rpc(
+            "get_prior_donor_history_flat",
+            {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
+        ).execute()
+        prior_df = to_df(getattr(rpc3, "data", None))
+
+        if not prior_df.empty:
+            prior_df["other_candidate_display"] = prior_df["other_candidate"].fillna("").map(title_case_name)
+            prior_df = prior_df.sort_values(
+                ["amount_to_candidate_all_time", "total_to_other_candidate"],
+                ascending=[False, False],
+            )
+
+            st.dataframe(
+                prior_df[[
+                    "donor_bucket",
+                    "donor_name_canonical",
+                    "donor_name_example",
+                    "amount_to_candidate_all_time",
+                    "first_to_candidate",
+                    "last_to_candidate",
+                    "other_candidate_display",
+                    "total_to_other_candidate",
+                    "n_to_other_candidate",
+                    "first_to_other_candidate",
+                    "last_to_other_candidate",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            download_button(
+                prior_df[[
+                    "donor_bucket",
+                    "donor_name_canonical",
+                    "donor_name_example",
+                    "amount_to_candidate_all_time",
+                    "first_to_candidate",
+                    "last_to_candidate",
+                    "other_candidate",
+                    "total_to_other_candidate",
+                    "n_to_other_candidate",
+                    "first_to_other_candidate",
+                    "last_to_other_candidate",
+                ]],
+                filename=f"prior_history_flat_{selected_candidate}_{datetime.now().date()}.csv",
+                label="Download prior history (flat) CSV",
+            )
+        else:
+            st.info("No prior-history rows returned (either none exist, or RPC returned zero rows).")
+
+    else:
+        # Raw JSON version
+        rpc3 = sb.rpc(
+            "get_donors_prior_history_before_candidate",
+            {"p_candidate": selected_candidate, "p_donor_bucket": p_donor_bucket},
+        ).execute()
+        prior_json_df = to_df(getattr(rpc3, "data", None))
+
+        if not prior_json_df.empty:
+            st.dataframe(
+                prior_json_df[[
+                    "donor_bucket",
+                    "donor_name_canonical",
+                    "donor_name_example",
+                    "amount_to_candidate_all_time",
+                    "first_to_candidate",
+                    "last_to_candidate",
+                    "other_candidate_history_prior",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            download_button(
+                prior_json_df,
+                filename=f"prior_history_json_{selected_candidate}_{datetime.now().date()}.csv",
+                label="Download prior history (JSON) CSV",
+            )
+        else:
+            st.info("No prior-history rows returned (either none exist, or RPC returned zero rows).")
