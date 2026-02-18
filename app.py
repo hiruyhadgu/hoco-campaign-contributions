@@ -14,7 +14,6 @@ def title_case_name(s: str) -> str:
     """Light title-case that won't explode on None."""
     if not s:
         return s
-    # Keep common particles in lower-case (optional)
     keep_lower = {"of", "and", "the", "for", "to", "in", "on", "at"}
     parts = re.split(r"(\s+)", s.strip())
     out = []
@@ -77,15 +76,12 @@ selected_candidate = st.sidebar.selectbox(
 
 show_charts = st.sidebar.checkbox("Show charts", value=True)
 
-# Optional: filter by year/office/district (if your data has these)
-# We can populate from v_candidate_totals for existing values:
-meta_resp = sb.table("v_candidate_totals").select("election_year,office,district").execute()
+# Filter by office/district only (election_year intentionally removed from UI)
+meta_resp = sb.table("v_candidate_totals").select("office,district").execute()
 meta_rows = meta_resp.data or []
-years = sorted({r.get("election_year") for r in meta_rows if r.get("election_year") is not None})
 offices = sorted({r.get("office") for r in meta_rows if r.get("office")})
 districts = sorted({r.get("district") for r in meta_rows if r.get("district")})
 
-year_filter = st.sidebar.multiselect("Election year", options=years, default=years[-1:] if years else [])
 office_filter = st.sidebar.multiselect("Office", options=offices, default=offices if offices else [])
 district_filter = st.sidebar.multiselect("District", options=districts, default=districts if districts else [])
 
@@ -108,36 +104,32 @@ with st.sidebar.form("contact_form", clear_on_submit=True):
                 "zip5": (zip5.strip() or None),
                 "source": source.strip() or None,
             }).execute()
-            # With your RLS, INSERT should succeed; SELECT is blocked.
             if getattr(ins, "data", None) is not None:
                 st.success("Thanks! You're signed up.")
             else:
-                # supabase-py sometimes returns errors on .error, sometimes in exception; be defensive
                 st.error("Signup failed. Please try again later.")
+
 
 # -----------------------------
 # Section 1: Candidate totals
 # -----------------------------
 st.subheader("Candidate totals (by donor bucket)")
 
+# election_year intentionally removed from select + display
 totals_resp = sb.table("v_candidate_totals").select(
-    "election_year,office,district,candidate,committee_name,committee_type,public_funding_requested,donor_bucket,txns,total_amount"
+    "office,district,candidate,committee_name,committee_type,public_funding_requested,donor_bucket,txns,total_amount"
 ).execute()
 totals_df = to_df(totals_resp.data)
 
 if not totals_df.empty:
     # filters
-    if year_filter:
-        totals_df = totals_df[totals_df["election_year"].isin(year_filter)]
-    if office_filter:
+    if office_filter and "office" in totals_df.columns:
         totals_df = totals_df[totals_df["office"].isin(office_filter)]
-    if district_filter:
+    if district_filter and "district" in totals_df.columns:
         totals_df = totals_df[totals_df["district"].isin(district_filter)]
 
-    # nicer display
     totals_df["candidate_display"] = totals_df["candidate"].fillna("").map(title_case_name)
 
-    # default: show only selected candidate unless user wants all
     show_all = st.checkbox("Show all candidates", value=False)
     if not show_all and selected_candidate:
         totals_df = totals_df[totals_df["candidate"] == selected_candidate]
@@ -146,9 +138,9 @@ if not totals_df.empty:
 
     st.dataframe(
         totals_df[[
-            "election_year","office","district","candidate_display",
-            "donor_bucket","txns","total_amount",
-            "committee_name","committee_type","public_funding_requested"
+            "office", "district", "candidate_display",
+            "donor_bucket", "txns", "total_amount",
+            "committee_name", "committee_type", "public_funding_requested"
         ]],
         use_container_width=True,
         hide_index=True,
@@ -156,8 +148,8 @@ if not totals_df.empty:
 
     download_button(
         totals_df[[
-            "election_year","office","district","candidate","donor_bucket","txns","total_amount",
-            "committee_name","committee_type","public_funding_requested"
+            "office", "district", "candidate", "donor_bucket", "txns", "total_amount",
+            "committee_name", "committee_type", "public_funding_requested"
         ]],
         filename=f"candidate_totals_{datetime.now().date()}.csv",
         label="Download candidate totals CSV",
@@ -181,39 +173,54 @@ else:
 
 
 # -----------------------------
-# Section 2: Donor overlap (flattened) via RPC
+# Section 2: Donor overlap (name-based) via RPC
 # -----------------------------
-st.subheader("Donor overlap (flattened)")
-
-st.caption("Donors who gave to the selected candidate *and* at least one other candidate (separate totals per candidate).")
+st.subheader("Donor overlap (name-based)")
+st.caption(
+    "Donors who gave to the selected candidate *and* at least one other candidate "
+    "(canonical-name matching; donor_key not used)."
+)
 
 if selected_candidate:
-    rpc = sb.rpc("get_donor_overlap_flat", {"p_candidate": selected_candidate}).execute()
+    donor_bucket_choice = st.selectbox("Donor bucket", options=["All", "Entity", "Individual"], index=0)
+    p_donor_bucket = None if donor_bucket_choice == "All" else donor_bucket_choice
+
+    rpc = sb.rpc("get_name_overlap_for_candidate", {
+        "p_candidate": selected_candidate,
+        "p_donor_bucket": p_donor_bucket
+    }).execute()
+
     overlap_df = to_df(getattr(rpc, "data", None))
 
     if not overlap_df.empty:
-        overlap_df["donor_name"] = overlap_df["donor_name"].fillna("")
-        overlap_df["candidate_display"] = overlap_df["candidate"].fillna("").map(title_case_name)
+        # Optional: show only "other candidate" rows (this function already returns only other candidates,
+        # but keep the checkbox for continuity in case you later change the function.)
+        only_others = st.checkbox("Exclude selected candidate rows (show 'other candidates' only)", value=True)
+        if only_others and "other_candidate" in overlap_df.columns:
+            # rows are inherently "other_candidate" rows; no-op kept for UI stability
+            pass
 
-        # Optional extra filtering
-        if year_filter and "election_year" in overlap_df.columns:
-            overlap_df = overlap_df[overlap_df["election_year"].isin(year_filter)]
-        if office_filter and "office" in overlap_df.columns:
-            overlap_df = overlap_df[overlap_df["office"].isin(office_filter)]
-        if district_filter and "district" in overlap_df.columns:
-            overlap_df = overlap_df[overlap_df["district"].isin(district_filter)]
+        overlap_df["other_candidate_display"] = overlap_df["other_candidate"].fillna("").map(title_case_name)
 
-        # Controls
-        only_others = st.checkbox("Exclude selected candidate rows (show 'other candidates' only)", value=False)
-        if only_others:
-            overlap_df = overlap_df[overlap_df["candidate"] != selected_candidate]
-
-        overlap_df = overlap_df.sort_values(["donor_name", "total_to_candidate"], ascending=[True, False])
+        # Sort: biggest target totals first, then biggest other totals
+        overlap_df = overlap_df.sort_values(
+            ["total_to_target", "total_to_other_candidate", "other_candidate"],
+            ascending=[False, False, True],
+        )
 
         st.dataframe(
             overlap_df[[
-                "donor_name","donor_bucket","candidate_display","total_to_candidate","txns",
-                "election_year","office","district","first_date","last_date","donor_key"
+                "donor_bucket",
+                "donor_name_canonical",
+                "donor_name_variants",
+                "total_to_target",
+                "first_to_target",
+                "last_to_target",
+                "other_candidate_display",
+                "total_to_other_candidate",
+                "n_contributions",
+                "first_to_other",
+                "last_to_other",
             ]],
             use_container_width=True,
             hide_index=True,
@@ -221,31 +228,40 @@ if selected_candidate:
 
         download_button(
             overlap_df[[
-                "donor_key","donor_name","donor_bucket","election_year","office","district",
-                "candidate","total_to_candidate","txns","first_date","last_date"
+                "donor_bucket",
+                "donor_name_canonical",
+                "donor_name_variants",
+                "total_to_target",
+                "first_to_target",
+                "last_to_target",
+                "other_candidate",
+                "total_to_other_candidate",
+                "n_contributions",
+                "first_to_other",
+                "last_to_other",
             ]],
-            filename=f"donor_overlap_flat_{selected_candidate}_{datetime.now().date()}.csv",
-            label="Download donor overlap CSV",
+            filename=f"name_overlap_{selected_candidate}_{datetime.now().date()}.csv",
+            label="Download name-overlap CSV",
         )
 
         if show_charts:
-            # Simple: top 25 donors by total across all candidates in overlap set
-            donor_totals = (
-                overlap_df.groupby(["donor_name"], as_index=False)["total_to_candidate"].sum()
-                .sort_values("total_to_candidate", ascending=False)
+            # Top 25 canonical donors by total_to_target (within overlap set)
+            top_donors = (
+                overlap_df.groupby(["donor_name_canonical"], as_index=False)["total_to_target"].max()
+                .sort_values("total_to_target", ascending=False)
                 .head(25)
             )
             c2 = (
-                alt.Chart(donor_totals)
+                alt.Chart(top_donors)
                 .mark_bar()
                 .encode(
-                    x=alt.X("total_to_candidate:Q", title="Total across overlap set"),
-                    y=alt.Y("donor_name:N", sort="-x", title="Top donors (overlap)"),
-                    tooltip=["donor_name:N", "total_to_candidate:Q"],
+                    x=alt.X("total_to_target:Q", title=f"Total to {title_case_name(selected_candidate)}"),
+                    y=alt.Y("donor_name_canonical:N", sort="-x", title="Top donors (canonical name)"),
+                    tooltip=["donor_name_canonical:N", "total_to_target:Q"],
                 )
             )
             st.altair_chart(c2, use_container_width=True)
     else:
-        st.info("No overlap found for this candidate (or the RPC/view has no rows).")
+        st.info("No name-overlap found for this candidate (or the RPC returned no rows).")
 else:
     st.warning("No candidates found. Populate v_candidates first.")
