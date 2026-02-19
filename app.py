@@ -32,10 +32,13 @@ def to_df(rows):
 
 @st.cache_resource
 def get_supabase():
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_ANON_KEY")
+    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
     if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars")
+        raise RuntimeError(
+            "Missing SUPABASE_URL or SUPABASE_ANON_KEY. "
+            "Set env vars or create .streamlit/secrets.toml"
+        )
     return create_client(url, key)
 
 
