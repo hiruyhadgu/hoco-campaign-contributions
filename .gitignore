@@ -1,3 +1,19 @@
 .streamlit/secrets.toml
 .env
-.env.*.streamlit/secrets.toml
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches / artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
