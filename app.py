@@ -173,6 +173,35 @@ def fetch_totals_by_type_fixed():
     return q.execute().data or []
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_mdcris_data_through():
+    sb = get_supabase()
+    # mdcris_contrib_staging uses quoted column names; safest is to query via SQL RPC or use .select with ordering.
+    # Using PostgREST: order by Transaction Date desc, take 1.
+    resp = (
+        cf_table(sb, "mdcris_contrib_staging")
+        .select('"Transaction Date"')
+        .order('"Transaction Date"', desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(resp, "data", None) or []
+    return rows[0].get("Transaction Date") if rows else None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sector_overview_for_candidate(candidate_last: str):
+    sb = get_supabase()
+    resp = (
+        cf_table(sb, "v_overview_sector_amount_count_candidate_2026")
+        .select('"Sector","Amount","Count","Candidate"')
+        .eq("Candidate", candidate_last)
+        .order("Amount", desc=True)
+        .execute()
+    )
+    return getattr(resp, "data", None) or []
+
+
 @st.cache_data(show_spinner=False)
 def fetch_overlap_summary_fixed(candidate_last: str, contributor_type: str | None):
     sb = get_supabase()
@@ -265,9 +294,9 @@ def fetch_top_donors_for_candidate_fixed(candidate_last: str, contributor_type_g
 # Atterbeary Registry views (used ONLY when Atterbeary is selected)
 # -----------------------------
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_v_reg_subject_entities_in_scope():
+def fetch_v_reg_subject_entities_in_scope_default():
     sb = get_supabase()
-    return cf_table(sb, "v_reg_subject_entities_in_scope").select("*").execute().data or []
+    return cf_table(sb, "v_reg_subject_entities_in_scope_default").select("*").execute().data or []
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -298,6 +327,24 @@ def fetch_v_reg_subject_concentration_power():
 def fetch_reg_contribution_all_registry():
     sb = get_supabase()
     return cf_table(sb, "reg_contribution").select("*").execute().data or []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_v_reg_subject_entities_in_scope():
+    sb = get_supabase()
+    return cf_table(sb, "v_reg_subject_entities_in_scope").select("*").execute().data or []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_v_reg_subject_tied_donors_in_scope_hop2():
+    sb = get_supabase()
+    return cf_table(sb, "v_reg_subject_tied_donors_in_scope_hop2").select("*").execute().data or []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_v_reg_subject_tied_donors_in_scope_hop2_all():
+    sb = get_supabase()
+    return cf_table(sb, "v_reg_subject_tied_donors_in_scope_hop2_all").select("*").execute().data
 
 
 # -----------------------------
@@ -345,6 +392,60 @@ def fetch_public_finance_donor_id():
         return rows[0]["id"] if rows else None
     except Exception:
         return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def candidate_has_public_financing_in_scope(candidate_last: str) -> bool:
+    """
+    True if Howard Public Election Fund appears as a donor to this candidate
+    in the fixed scope tables (cf.contributions + canonical donor id).
+    """
+    sb = get_supabase()
+
+    public_fund_id = fetch_public_finance_donor_id()
+    if public_fund_id is None:
+        return False
+
+    # Find candidate_id
+    cand_resp = (
+        sb.schema("cf")
+        .table("candidates")
+        .select("id")
+        .ilike("last_name", candidate_last)
+        .limit(1)
+        .execute()
+    )
+    cand_rows = getattr(cand_resp, "data", None) or []
+    if not cand_rows:
+        return False
+    candidate_id = cand_rows[0]["id"]
+
+    # Candidate committees
+    cc_resp = (
+        sb.schema("cf")
+        .table("candidate_committees")
+        .select("id")
+        .eq("candidate_id", candidate_id)
+        .limit(1000)
+        .execute()
+    )
+    cc_rows = getattr(cc_resp, "data", None) or []
+    committee_ids = [r["id"] for r in cc_rows if r.get("id") is not None]
+    if not committee_ids:
+        return False
+
+    # Check any contribution rows with canonical_donor_id = public fund
+    q = (
+        sb.schema("cf")
+        .table("contributions")
+        .select("id")
+        .in_("candidate_committee_id", committee_ids)
+        .eq("canonical_donor_id", public_fund_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(q, "data", None) or []
+    return bool(rows)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -423,6 +524,12 @@ def compute_snapshot_metrics(
     amt_entity = _sum_group("Entity")
     amt_public = _sum_group("Public Financing")
     amt_unknown = _sum_group("Unknown")
+
+    # If the campaign is publicly financed, treat UNKNOWN as Public Financing
+    # (common when donor typing is missing).
+    if candidate_has_public_financing_in_scope(candidate_last):
+        amt_public += amt_unknown
+        amt_unknown = 0.0
 
     private_total = max(total_amount - amt_public, 0.0)
 
@@ -546,7 +653,15 @@ def fetch_candidate_state_totals(candidate_last: str):
     df = to_df(rows)
     if df.empty or "state" not in df.columns or "total_amount" not in df.columns:
         return []
-    df["state"] = df["state"].fillna("").str.upper().replace({"": "UNKNOWN"})
+
+    # Normalize state
+    df["state"] = df["state"].fillna("").astype(str).str.upper().replace({"": "UNKNOWN"})
+
+    # If publicly financed, relabel the public-fund rows (which often have UNKNOWN state)
+    if candidate_has_public_financing_in_scope(candidate_last) and "contributor_name" in df.columns:
+        mask_public = df["contributor_name"].fillna("").str.lower().str.contains("howard public election fund")
+        df.loc[mask_public, "state"] = "PUBLIC FINANCING"
+
     out = (
         df.groupby("state", as_index=False)["total_amount"]
         .sum()
@@ -848,46 +963,87 @@ with tab_overview:
         else:
             render_campaign_finance_snapshot(selected_last, selected_first, totals_df, by_type_all)
 
-        if not show_all_candidates:
-            st.markdown("### Top donors to selected candidate")
+            # -----------------------------
+            # Sector breakdown (non-individual only; excludes unclassified)
+            # -----------------------------
+            st.markdown("### Sector breakdown (non-individual contributions only)")
 
-            top_n = st.slider("Show top N donors", min_value=10, max_value=200, value=50, step=10)
+            data_through = fetch_mdcris_data_through()
+            if data_through:
+                st.caption(f"Data through {data_through} (MDCRIS upload).")
 
-            ct_group = None
-            if p_contributor_type == "Individual":
-                ct_group = "Individual"
-            elif p_contributor_type == "Entity":
-                ct_group = "Entity"
+            sector_rows = fetch_sector_overview_for_candidate((selected_last or "").upper())
+            sector_df = to_df(sector_rows)
 
-            top_rows = fetch_top_donors_for_candidate_fixed(selected_last, ct_group, top_n)
-            top_df = to_df(top_rows)
+            # Placeholder row for publicly-financed candidates with no non-individual contributions
+            if sector_df.empty:
+                sector_df = pd.DataFrame([{
+                    "Sector": "No non-individual contributions in file",
+                    "Amount": 0,
+                    "Count": 0,
+                    "Candidate": (selected_last or "").upper()
+                }])
 
-            if top_df.empty:
-                st.info("No donors found for this candidate under the current filters.")
-            else:
-                show_cols = [c for c in [
-                    "contributor_name",
-                    "contributor_type_group",
-                    "contributor_type",
-                    "city",
-                    "state",
-                    "total_amount",
-                    "txn_count",
-                    "first_txn",
-                    "last_txn",
-                ] if c in top_df.columns]
+            # drop Candidate column for display clarity
+            if "Candidate" in sector_df.columns:
+                sector_df = sector_df.drop(columns=["Candidate"])
 
-                st.dataframe(
-                    top_df[show_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            # Always show in consistent column order
+            show_cols = ["Sector", "Amount", "Count"]
+            show_cols = [c for c in show_cols if c in sector_df.columns]
 
-                download_button(
-                    top_df[show_cols],
-                    filename=f"top_donors_{selected_last}_{SCOPE_YEAR}_{datetime.now().date()}.csv",
-                    label="Download top donors CSV",
-                )
+            st.dataframe(
+                sector_df[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            download_button(
+                sector_df[show_cols],
+                filename=f"sector_breakdown_{(selected_last or '').lower()}_{datetime.now().date()}.csv",
+                label="Download sector breakdown CSV",
+            )
+
+            if not show_all_candidates:
+                st.markdown("### Top donors to selected candidate")
+
+                top_n = st.slider("Show top N donors", min_value=10, max_value=200, value=50, step=10)
+
+                ct_group = None
+                if p_contributor_type == "Individual":
+                    ct_group = "Individual"
+                elif p_contributor_type == "Entity":
+                    ct_group = "Entity"
+
+                top_rows = fetch_top_donors_for_candidate_fixed(selected_last, ct_group, top_n)
+                top_df = to_df(top_rows)
+
+                if top_df.empty:
+                    st.info("No donors found for this candidate under the current filters.")
+                else:
+                    show_cols = [c for c in [
+                        "contributor_name",
+                        "contributor_type_group",
+                        "contributor_type",
+                        "city",
+                        "state",
+                        "total_amount",
+                        "txn_count",
+                        "first_txn",
+                        "last_txn",
+                    ] if c in top_df.columns]
+
+                    st.dataframe(
+                        top_df[show_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    download_button(
+                        top_df[show_cols],
+                        filename=f"top_donors_{selected_last}_{SCOPE_YEAR}_{datetime.now().date()}.csv",
+                        label="Download top donors CSV",
+                    )
 
 
 # -----------------------------
@@ -1091,25 +1247,32 @@ and “coordination patterns” (fundraiser-style clustering) without making acc
         unsafe_allow_html=True,
     )
 
-    with st.expander("Corporate & special-interest (Entity donors)", expanded=True):
-        top_n_entities = st.slider("Top entity donors", min_value=10, max_value=200, value=50, step=10, key="top_entities_slider")
-        ent_rows = fetch_candidate_entities_top(selected_last, top_n_entities)
-        ent_df = to_df(ent_rows)
+    # For publicly financed campaigns, entity/PAC contributions are generally prohibited or absent.
+    # Show a message instead of the entity donors expander so users aren't misled.
+    if candidate_has_public_financing_in_scope(selected_last):
+        st.info(
+            "This candidate appears to be publicly financed; entity/PAC contributions may be prohibited or absent."
+        )
+    else:
+        with st.expander("Corporate & special-interest (Entity donors)", expanded=True):
+            top_n_entities = st.slider("Top entity donors", min_value=10, max_value=200, value=50, step=10, key="top_entities_slider")
+            ent_rows = fetch_candidate_entities_top(selected_last, top_n_entities)
+            ent_df = to_df(ent_rows)
 
-        if ent_df.empty:
-            st.info("No entity donors found for this candidate under the current scope.")
-        else:
-            show_cols = [c for c in [
-                "contributor_name", "contributor_type", "city", "state",
-                "total_amount", "txn_count", "first_txn", "last_txn"
-            ] if c in ent_df.columns]
-            st.dataframe(ent_df[show_cols], use_container_width=True, hide_index=True)
+            if ent_df.empty:
+                st.info("No entity donors found for this candidate under the current scope.")
+            else:
+                show_cols = [c for c in [
+                    "contributor_name", "contributor_type", "city", "state",
+                    "total_amount", "txn_count", "first_txn", "last_txn"
+                ] if c in ent_df.columns]
+                st.dataframe(ent_df[show_cols], use_container_width=True, hide_index=True)
 
-            download_button(
-                ent_df[show_cols],
-                filename=f"entity_donors_{selected_last}_{SCOPE_YEAR}_{datetime.now().date()}.csv",
-                label="Download entity donors CSV",
-            )
+                download_button(
+                    ent_df[show_cols],
+                    filename=f"entity_donors_{selected_last}_{SCOPE_YEAR}_{datetime.now().date()}.csv",
+                    label="Download entity donors CSV",
+                )
 
     with st.expander("Geography (state totals)", expanded=False):
         state_rows = fetch_candidate_state_totals(selected_last)
@@ -1259,8 +1422,18 @@ with tab_registry:
         unsafe_allow_html=True,
     )
 
-    subj_df = to_df(fetch_v_reg_subject_entities_in_scope())
-    tied_df = to_df(fetch_v_reg_subject_tied_donors_in_scope())
+    show_all_subjects = st.toggle(
+        "Show all entities (include smaller donors / not-yet-documented)",
+        value=False,
+        help="Off = >$500 and documented entities only. On = all entities in the registry scope.",
+    )
+
+    if show_all_subjects:
+        subj_df = to_df(fetch_v_reg_subject_entities_in_scope())
+        tied_df = to_df(fetch_v_reg_subject_tied_donors_in_scope_hop2_all())
+    else:
+        subj_df = to_df(fetch_v_reg_subject_entities_in_scope_default())
+        tied_df = to_df(fetch_v_reg_subject_tied_donors_in_scope_hop2())
     conc_df = to_df(fetch_v_reg_subject_concentration_power())
     dons_df = to_df(fetch_v_reg_entity_donations_in_scope())
     net_nodes_df = to_df(fetch_v_reg_subject_network_nodes())
